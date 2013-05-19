@@ -2,7 +2,8 @@ import times
 import six
 from .connections import resolve_connection
 from .job import Job, Status
-from .exceptions import NoSuchJobError, UnpickleError, InvalidJobOperationError
+from .exceptions import (NoSuchJobError, UnpickleError,
+                         InvalidJobOperationError, DequeueTimeout)
 from .compat import total_ordering
 from six.moves import map
 from six.moves import zip
@@ -66,29 +67,48 @@ class Queue(object):
         """Returns whether the current queue is empty."""
         return self.count == 0
 
+    def safe_fetch_job(self, job_id):
+        try:
+            job = Job.safe_fetch(job_id, connection=self.connection)
+        except NoSuchJobError:
+            self.remove(job_id)
+            return None
+        except UnpickleError:
+            return None
+        return job
+
+    def get_job_ids(self, start=0, limit=-1):
+        """Returns a slice of job IDs in the queue."""
+        if limit >= 0:
+            end = start + limit
+        else:
+            end = limit
+        return self.connection.lrange(self.key, start, end)
+
+    def get_jobs(self, start=0, limit=-1):
+        """Returns a slice of jobs in the queue."""
+        job_ids = self.get_job_ids(start, limit)
+        return compact([self.safe_fetch_job(job_id) for job_id in job_ids])
+
     @property
     def job_ids(self):
         """Returns a list of all job IDS in the queue."""
-        return self.connection.lrange(self.key, 0, -1)
+        return self.get_job_ids()
 
     @property
     def jobs(self):
         """Returns a list of all (valid) jobs in the queue."""
-        def safe_fetch(job_id):
-            try:
-                job = Job.safe_fetch(job_id, connection=self.connection)
-            except NoSuchJobError:
-                return None
-            except UnpickleError:
-                return None
-            return job
-
-        return compact([safe_fetch(job_id) for job_id in self.job_ids])
+        return self.get_jobs()
 
     @property
     def count(self):
         """Returns a count of all messages in the queue."""
         return self.connection.llen(self.key)
+
+    def remove(self, job_or_id):
+        """Removes Job from queue, accepts either a Job instance or ID."""
+        job_id = job_or_id.id if isinstance(job_or_id, Job) else job_or_id
+        return self.connection._lrem(self.key, 0, job_id)
 
     def compact(self):
         """Removes all "dead" jobs from the queue by cycling through it, while
@@ -109,7 +129,7 @@ class Queue(object):
         """Pushes a job ID on the corresponding Redis queue."""
         self.connection.rpush(self.key, job_id)
 
-    def enqueue_call(self, func, args=None, kwargs=None, timeout=None, result_ttl=None): #noqa
+    def enqueue_call(self, func, args=None, kwargs=None, timeout=None, result_ttl=None):  # noqa
         """Creates a job to represent the delayed function call and enqueues
         it.
 
@@ -189,7 +209,7 @@ class Queue(object):
         return self.connection.lpop(self.key)
 
     @classmethod
-    def lpop(cls, queue_keys, blocking, connection=None):
+    def lpop(cls, queue_keys, timeout, connection=None):
         """Helper method.  Intermediate method to abstract away from some
         Redis API details, where LPOP accepts only a single key, whereas BLPOP
         accepts multiple.  So if we want the non-blocking LPOP, we need to
@@ -197,12 +217,21 @@ class Queue(object):
 
         Until Redis receives a specific method for this, we'll have to wrap it
         this way.
+
+        The timeout parameter is interpreted as follows:
+            None - non-blocking (return immediately)
+             > 0 - maximum number of seconds to block
         """
         connection = resolve_connection(connection)
-        if blocking:
-            queue_key, job_id = connection.blpop(queue_keys)
+        if timeout is not None:  # blocking variant
+            if timeout == 0:
+                raise ValueError('RQ does not support indefinite timeouts. Please pick a timeout value > 0.')
+            result = connection.blpop(queue_keys, timeout)
+            if result is None:
+                raise DequeueTimeout(timeout, queue_keys)
+            queue_key, job_id = result
             return queue_key, job_id
-        else:
+        else:  # non-blocking variant
             for queue_key in queue_keys:
                 blob = connection.lpop(queue_key)
                 if blob is not None:
@@ -232,16 +261,19 @@ class Queue(object):
         return job
 
     @classmethod
-    def dequeue_any(cls, queues, blocking, connection=None):
+    def dequeue_any(cls, queues, timeout, connection=None):
         """Class method returning the Job instance at the front of the given
         set of Queues, where the order of the queues is important.
 
-        When all of the Queues are empty, depending on the `blocking` argument,
-        either blocks execution of this function until new messages arrive on
-        any of the queues, or returns None.
+        When all of the Queues are empty, depending on the `timeout` argument,
+        either blocks execution of this function for the duration of the
+        timeout or until new messages arrive on any of the queues, or returns
+        None.
+
+        See the documentation of cls.lpop for the interpretation of timeout.
         """
         queue_keys = [q.key for q in queues]
-        result = cls.lpop(queue_keys, blocking, connection=connection)
+        result = cls.lpop(queue_keys, timeout, connection=connection)
         if result is None:
             return None
         queue_key, job_id = result
@@ -251,7 +283,7 @@ class Queue(object):
         except NoSuchJobError:
             # Silently pass on jobs that don't exist (anymore),
             # and continue by reinvoking the same function recursively
-            return cls.dequeue_any(queues, blocking, connection=connection)
+            return cls.dequeue_any(queues, timeout, connection=connection)
         except UnpickleError as e:
             # Attach queue information on the exception for improved error
             # reporting
@@ -306,11 +338,11 @@ class FailedQueue(Queue):
             job = Job.fetch(job_id, connection=self.connection)
         except NoSuchJobError:
             # Silently ignore/remove this job and return (i.e. do nothing)
-            self.connection._lrem(self.key, 0, job_id)
+            self.remove(job_id)
             return
 
         # Delete it from the failed queue (raise an error if that failed)
-        if self.connection._lrem(self.key, 0, job.id) == 0:
+        if self.remove(job) == 0:
             raise InvalidJobOperationError('Cannot requeue non-failed jobs.')
 
         job.status = Status.QUEUED

@@ -73,13 +73,13 @@ class Job(object):
             args = ()
         if kwargs is None:
             kwargs = {}
-        assert isinstance(args, tuple), '%r is not a valid args list.' % (args,)
+        assert isinstance(args, (tuple, list)), '%r is not a valid args list.' % (args,)
         assert isinstance(kwargs, dict), '%r is not a valid kwargs dict.' % (kwargs,)
         job = cls(connection=connection)
         if inspect.ismethod(func):
             job._instance = func.__self__
             job._func_name = func.__name__
-        elif inspect.isfunction(func):
+        elif inspect.isfunction(func) or inspect.isbuiltin(func):
             job._func_name = '%s.%s' % (func.__module__, func.__name__)
         else:  # we expect a string
             job._func_name = func
@@ -288,9 +288,10 @@ class Job(object):
         self._status = obj.get('status') if obj.get('status') else None
         self.meta = unpickle(obj.get('meta')) if obj.get('meta') else {}
 
-    def save(self):
+    def save(self, pipeline=None):
         """Persists the current job instance to its corresponding Redis key."""
         key = self.key
+        connection = pipeline if pipeline is not None else self.connection
 
         obj = {}
         obj['created_at'] = times.format(self.created_at or times.now(), 'UTC')
@@ -318,7 +319,7 @@ class Job(object):
         if self.meta:
             obj['meta'] = pickle.dumps(self.meta)
 
-        self.connection.hmset(key, obj)
+        connection.hmset(key, obj)
 
     def cancel(self):
         """Cancels the given job, which will prevent the job from ever being
@@ -347,6 +348,13 @@ class Job(object):
         return self._result
 
 
+    def get_ttl(self, default_ttl=None):
+        """Returns ttl for a job that determines how long a job and its result
+        will be persisted. In the future, this method will also be responsible
+        for determining ttl for repeated jobs.
+        """
+        return default_ttl if self.result_ttl is None else self.result_ttl
+
     # Representation
     def get_call_string(self):  # noqa
         """Returns a string representation of the call, formatted as a regular
@@ -359,6 +367,22 @@ class Job(object):
         arg_list += ['%s=%r' % (k, v) for k, v in self.kwargs.items()]
         args = ', '.join(arg_list)
         return '%s(%s)' % (self.func_name, args)
+
+    def cleanup(self, ttl=None, pipeline=None):
+        """Prepare job for eventual deletion (if needed). This method is usually
+        called after successful execution. How long we persist the job and its
+        result depends on the value of result_ttl:
+        - If result_ttl is 0, cleanup the job immediately.
+        - If it's a positive number, set the job to expire in X seconds.
+        - If result_ttl is negative, don't set an expiry to it (persist
+          forever)
+        """        
+        if ttl == 0:
+            self.cancel()
+        elif ttl > 0:
+            connection = pipeline if pipeline is not None else self.connection
+            connection.expire(self.key, ttl)
+        
 
     def __str__(self):
         return '<Job %s: %s>' % (self.id, self.description)

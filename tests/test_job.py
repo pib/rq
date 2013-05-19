@@ -1,7 +1,7 @@
 import times
 from datetime import datetime
 from tests import RQTestCase
-from tests.fixtures import Calculator, some_calculation, say_hello, access_self
+from tests.fixtures import Number, some_calculation, say_hello, access_self
 from tests.helpers import strip_milliseconds
 from six.moves import cPickle as pickle
 from rq.job import Job, get_current_job
@@ -51,13 +51,13 @@ class TestJob(RQTestCase):
 
     def test_create_instance_method_job(self):
         """Creation of jobs for instance methods."""
-        c = Calculator(2)
-        job = Job.create(func=c.calculate, args=(3, 4))
+        n = Number(2)
+        job = Job.create(func=n.div, args=(4,))
 
         # Job data is set
-        self.assertEquals(job.func, c.calculate)
-        self.assertEquals(job.instance, c)
-        self.assertEquals(job.args, (3, 4))
+        self.assertEquals(job.func, n.div)
+        self.assertEquals(job.instance, n)
+        self.assertEquals(job.args, (4,))
 
     def test_create_job_from_string_function(self):
         """Creation of jobs using string specifier."""
@@ -219,3 +219,33 @@ class TestJob(RQTestCase):
         id = job.perform()
         self.assertEqual(job.id, id)
         self.assertEqual(job.func, access_self)
+
+    def test_get_ttl(self):
+        """Getting job TTL."""
+        job_ttl = 1
+        default_ttl = 2
+        job = Job.create(func=say_hello, result_ttl=job_ttl)
+        job.save()
+        self.assertEqual(job.get_ttl(default_ttl=default_ttl), job_ttl)
+        self.assertEqual(job.get_ttl(), job_ttl)
+        job = Job.create(func=say_hello)
+        job.save()
+        self.assertEqual(job.get_ttl(default_ttl=default_ttl), default_ttl)
+        self.assertEqual(job.get_ttl(), None)
+
+    def test_cleanup(self):
+        """Test that jobs and results are expired properly."""
+        job = Job.create(func=say_hello)
+        job.save()
+        
+        # Jobs with negative TTLs don't expire
+        job.cleanup(ttl=-1)
+        self.assertEqual(self.testconn.ttl(job.key), -1)
+
+        # Jobs with positive TTLs are eventually deleted 
+        job.cleanup(ttl=100)
+        self.assertEqual(self.testconn.ttl(job.key), 100)
+
+        # Jobs with 0 TTL are immediately deleted
+        job.cleanup(ttl=0)
+        self.assertRaises(NoSuchJobError, Job.fetch, job.id, self.testconn)

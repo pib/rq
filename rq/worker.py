@@ -21,7 +21,7 @@ from .connections import get_current_connection
 from .job import Job, Status
 from .utils import make_colorizer
 from .logutils import setup_loghandlers
-from .exceptions import NoQueueError, UnpickleError
+from .exceptions import NoQueueError, UnpickleError, DequeueTimeout
 from .timeouts import death_penalty_after
 from .version import VERSION
 
@@ -29,6 +29,7 @@ green = make_colorizer('darkgreen')
 yellow = make_colorizer('darkyellow')
 blue = make_colorizer('darkblue')
 
+DEFAULT_WORKER_TTL = 420
 DEFAULT_RESULT_TTL = 500
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,7 @@ class Worker(object):
         if connection is None:
             connection = get_current_connection()
         if not connection.exists(worker_key):
+            connection.srem(cls.redis_workers_keys, worker_key)
             return None
 
         name = worker_key[len(prefix):]
@@ -99,8 +101,9 @@ class Worker(object):
         return worker
 
 
-    def __init__(self, queues, name=None, default_result_ttl=DEFAULT_RESULT_TTL,
-            connection=None, exc_handler=None):  # noqa
+    def __init__(self, queues, name=None,
+            default_result_ttl=DEFAULT_RESULT_TTL, connection=None,
+            exc_handler=None, default_worker_ttl=DEFAULT_WORKER_TTL):  # noqa
         if connection is None:
             connection = get_current_connection()
         self.connection = connection
@@ -111,6 +114,7 @@ class Worker(object):
         self.validate_queues()
         self._exc_handlers = []
         self.default_result_ttl = default_result_ttl
+        self.default_worker_ttl = default_worker_ttl
         self._state = 'starting'
         self._is_horse = False
         self._horse_pid = 0
@@ -197,17 +201,18 @@ class Worker(object):
         key = self.key
         now = time.time()
         queues = ','.join(self.queue_names())
-        with self.connection.pipeline() as p:
+        with self.connection._pipeline() as p:
             p.delete(key)
             p.hset(key, 'birth', now)
             p.hset(key, 'queues', queues)
             p.sadd(self.redis_workers_keys, key)
+            p.expire(key, self.default_worker_ttl)
             p.execute()
 
     def register_death(self):
         """Registers its own death."""
         self.log.debug('Registering death')
-        with self.connection.pipeline() as p:
+        with self.connection._pipeline() as p:
             # We cannot use self.state = 'dead' here, because that would
             # rollback the pipeline
             p.srem(self.redis_workers_keys, self.key)
@@ -303,10 +308,9 @@ class Worker(object):
                 self.log.info('')
                 self.log.info('*** Listening on %s...' % \
                         green(', '.join(qnames)))
-                wait_for_job = not burst
+                timeout = None if burst else max(1, self.default_worker_ttl - 60)
                 try:
-                    result = Queue.dequeue_any(self.queues, wait_for_job, \
-                            connection=self.connection)
+                    result = self.dequeue_job_and_maintain_ttl(timeout)
                     if result is None:
                         break
                 except StopRequested:
@@ -324,13 +328,28 @@ class Worker(object):
                 self.log.info('%s: %s (%s)' % (green(queue.name),
                     blue(job.description), job.id))
 
+                self.connection.expire(self.key, (job.timeout or 180) + 60)
                 self.fork_and_perform_job(job)
+                self.connection.expire(self.key, self.default_worker_ttl)
 
                 did_perform_work = True
         finally:
             if not self.is_horse:
                 self.register_death()
         return did_perform_work
+
+
+    def dequeue_job_and_maintain_ttl(self, timeout):
+        while True:
+            try:
+                return Queue.dequeue_any(self.queues, timeout,
+                        connection=self.connection)
+            except DequeueTimeout:
+                pass
+
+            self.log.debug('Sending heartbeat to prevent worker timeout.')
+            self.connection.expire(self.key, self.default_worker_ttl)
+
 
     def fork_and_perform_job(self, job):
         """Spawns a work horse to perform the actual work and passes it a job.
@@ -396,8 +415,17 @@ class Worker(object):
             # Pickle the result in the same try-except block since we need to
             # use the same exc handling when pickling fails
             pickled_rv = pickle.dumps(rv)
+            job._result = pickled_rv
             job._status = Status.FINISHED
             job.ended_at = times.now()
+
+            result_ttl = job.get_ttl(self.default_result_ttl)
+            pipeline = self.connection._pipeline()
+            if result_ttl != 0:
+                job.save(pipeline=pipeline)
+            job.cleanup(result_ttl, pipeline=pipeline)
+            pipeline.execute()
+
         except:
             # Use the public setter here, to immediately update Redis
             job.status = Status.FAILED
@@ -407,29 +435,14 @@ class Worker(object):
         if rv is None:
             self.log.info('Job OK')
         else:
-            self.log.info('Job OK, result = %s' % (yellow(unicode(rv)),))
+            self.log.info('Job OK, result = %s' % (yellow(rv),))
 
-        # How long we persist the job result depends on the value of
-        # result_ttl:
-        # - If result_ttl is 0, cleanup the job immediately.
-        # - If it's a positive number, set the job to expire in X seconds.
-        # - If result_ttl is negative, don't set an expiry to it (persist
-        #   forever)
-        result_ttl =  self.default_result_ttl if job.result_ttl is None else job.result_ttl  # noqa
         if result_ttl == 0:
-            job.delete()
             self.log.info('Result discarded immediately.')
+        elif result_ttl > 0:
+            self.log.info('Result is kept for %d seconds.' % result_ttl)
         else:
-            p = self.connection.pipeline()
-            p.hset(job.key, 'result', pickled_rv)
-            p.hset(job.key, 'status', job._status)
-            p.hset(job.key, 'ended_at', times.format(job.ended_at, 'UTC'))
-            if result_ttl > 0:
-                p.expire(job.key, result_ttl)
-                self.log.info('Result is kept for %d seconds.' % result_ttl)
-            else:
-                self.log.warning('Result will never expire, clean up result key manually.')
-            p.execute()
+            self.log.warning('Result will never expire, clean up result key manually.')
 
         return True
 

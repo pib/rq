@@ -1,5 +1,5 @@
 from tests import RQTestCase
-from tests.fixtures import Calculator, div_by_zero, say_hello, some_calculation
+from tests.fixtures import Number, div_by_zero, say_hello, some_calculation
 from rq import Queue, get_failed_queue
 from rq.job import Job, Status
 from rq.exceptions import InvalidJobOperationError
@@ -49,6 +49,32 @@ class TestQueue(RQTestCase):
 
         self.testconn.rpush('rq:queue:example', 'sentinel message')
         self.assertEquals(q.is_empty(), False)
+
+    def test_remove(self):
+        """Ensure queue.remove properly removes Job from queue."""
+        q = Queue('example')
+        job = q.enqueue(say_hello)
+        self.assertIn(job.id, q.job_ids)
+        q.remove(job)
+        self.assertNotIn(job.id, q.job_ids)
+
+        job = q.enqueue(say_hello)
+        self.assertIn(job.id, q.job_ids)
+        q.remove(job.id)
+        self.assertNotIn(job.id, q.job_ids)
+
+    def test_jobs(self):
+        """Getting jobs out of a queue."""
+        q = Queue('example')
+        self.assertEqual(q.jobs, [])
+        job = q.enqueue(say_hello)
+        self.assertEqual(q.jobs, [job])
+
+        # Fetching a deleted removes it from queue
+        job.delete()
+        self.assertEqual(q.job_ids, [job.id])
+        q.jobs
+        self.assertEqual(q.job_ids, [])
 
     def test_compact(self):
         """Compacting queueus."""
@@ -135,14 +161,26 @@ class TestQueue(RQTestCase):
     def test_dequeue_instance_method(self):
         """Dequeueing instance method jobs from queues."""
         q = Queue()
-        c = Calculator(2)
-        result = q.enqueue(c.calculate, 3, 4)
+        n = Number(2)
+        q.enqueue(n.div, 4)
 
         job = q.dequeue()
+
         # The instance has been pickled and unpickled, so it is now a separate
         # object. Test for equality using each object's __dict__ instead.
-        self.assertEquals(job.instance.__dict__, c.__dict__)
-        self.assertEquals(job.func.__name__, 'calculate')
+        self.assertEquals(job.instance.__dict__, n.__dict__)
+        self.assertEquals(job.func.__name__, 'div')
+        self.assertEquals(job.args, (4,))
+
+    def test_dequeue_class_method(self):
+        """Dequeueing class method jobs from queues."""
+        q = Queue()
+        q.enqueue(Number.divide, 3, 4)
+
+        job = q.dequeue()
+
+        self.assertEquals(job.instance.__dict__, Number.__dict__)
+        self.assertEquals(job.func.__name__, 'divide')
         self.assertEquals(job.args, (3, 4))
 
     def test_dequeue_ignores_nonexisting_jobs(self):
@@ -166,11 +204,11 @@ class TestQueue(RQTestCase):
         fooq = Queue('foo')
         barq = Queue('bar')
 
-        self.assertEquals(Queue.dequeue_any([fooq, barq], False), None)
+        self.assertEquals(Queue.dequeue_any([fooq, barq], None), None)
 
         # Enqueue a single item
         barq.enqueue(say_hello)
-        job, queue = Queue.dequeue_any([fooq, barq], False)
+        job, queue = Queue.dequeue_any([fooq, barq], None)
         self.assertEquals(job.func, say_hello)
         self.assertEquals(queue, barq)
 
@@ -178,14 +216,14 @@ class TestQueue(RQTestCase):
         barq.enqueue(say_hello, 'for Bar')
         fooq.enqueue(say_hello, 'for Foo')
 
-        job, queue = Queue.dequeue_any([fooq, barq], False)
+        job, queue = Queue.dequeue_any([fooq, barq], None)
         self.assertEquals(queue, fooq)
         self.assertEquals(job.func, say_hello)
         self.assertEquals(job.origin, fooq.name)
         self.assertEquals(job.args[0], 'for Foo',
                 'Foo should be dequeued first.')
 
-        job, queue = Queue.dequeue_any([fooq, barq], False)
+        job, queue = Queue.dequeue_any([fooq, barq], None)
         self.assertEquals(queue, barq)
         self.assertEquals(job.func, say_hello)
         self.assertEquals(job.origin, barq.name)
@@ -201,7 +239,7 @@ class TestQueue(RQTestCase):
 
         # Dequeue simply ignores the missing job and returns None
         self.assertEquals(q.count, 1)
-        self.assertEquals(Queue.dequeue_any([Queue(), Queue('low')], False),  # noqa
+        self.assertEquals(Queue.dequeue_any([Queue(), Queue('low')], None),  # noqa
                 None)
         self.assertEquals(q.count, 0)
 

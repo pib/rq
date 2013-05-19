@@ -1,7 +1,34 @@
-### 0.3.6
+### 0.3.8
 (not yet released)
 
-- ...
+- `rqworker` and `rqinfo` have a  `--url` argument to connect to a Redis url.
+
+- `rqworker` and `rqinfo` have a `--socket` option to connect to a Redis server
+  through a Unix socket.
+
+- `rqworker` reads `SENTRY_DSN` from the environment, unless specifically
+  provided on the command line.
+
+- `Queue` has a new API that supports paging `get_jobs(3, 7)`, which will
+  return at most 7 jobs, starting from the 3rd.
+
+
+### 0.3.7
+(February 26th, 2013)
+
+- Fixed bug where workers would not execute builtin functions properly.
+
+
+### 0.3.6
+(February 18th, 2013)
+
+- Worker registrations now expire.  This should prevent `rqinfo` from reporting
+  about ghosted workers.  (Thanks, @yaniv-aknin!)
+
+- `rqworker` will automatically clean up ghosted worker registrations from
+  pre-0.3.6 runs.
+
+- `rqworker` grew a `-q` flag, to be more silent (only warnings/errors are shown)
 
 
 ### 0.3.5
