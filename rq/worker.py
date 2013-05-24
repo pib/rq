@@ -414,8 +414,8 @@ class Worker(object):
 
             # Pickle the result in the same try-except block since we need to
             # use the same exc handling when pickling fails
-            pickled_rv = pickle.dumps(rv)
-            job._result = pickled_rv
+            pickled_rv = pickle.dumps(rv)  # noqa
+            job._result = rv
             job._status = Status.FINISHED
             job.ended_at = times.now()
 
