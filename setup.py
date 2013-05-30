@@ -10,9 +10,9 @@ from setuptools import setup, find_packages
 def get_version():
     basedir = os.path.dirname(__file__)
     with open(os.path.join(basedir, 'rq/version.py')) as f:
-        VERSION = None
-        exec(f.read())
-        return VERSION
+        locals = {}
+        exec(f.read(), globals(), locals)
+        return locals['VERSION']
     raise RuntimeError('No version info found.')
 
 
@@ -41,6 +41,7 @@ setup(
     zip_safe=False,
     platforms='any',
     install_requires=get_dependencies(),
+    use_2to3=True,
     entry_points='''\
     [console_scripts]
     rqworker = rq.scripts.rqworker:main
