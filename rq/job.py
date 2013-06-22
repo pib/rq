@@ -98,6 +98,8 @@ class Job(object):
     def func_name(self):
         return self._func_name
 
+    __name__ = func_name
+
     def _get_status(self):
         self._status = self.connection.hget(self.key, 'status')
         return self._status
